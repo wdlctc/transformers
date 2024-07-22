@@ -1095,7 +1095,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def narrow_processing(self, hidden_states, labels):
 
         bsz, q_len, hidden_size = hidden_states.size()
-        tmp = q_len // self.pretraining_tp
+        tmp = q_len // self.minis
 
         if labels is None:
             hidden_states = hidden_states[..., -1:, :]
@@ -1111,7 +1111,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         Fused = FusedCrossEntropyLMhead(self.lm_head.weight)
         
         loss = None
-        for i in range(self.pretraining_tp):
+        for i in range(self.minis):
 
 
             shift_hidden_states = hidden_states[..., i * tmp : (i+1)*tmp, :].contiguous()
