@@ -1006,7 +1006,7 @@ class _cross_entropy(torch.autograd.Function):
         grad_input[mask, indices[mask]] -= 1
         # grad_input[mask] /= batch_size
         grad_input[reverse_mask] = 0
-        grad_input = grad_input.to(torch.bfloat16)
+        grad_input = grad_input.to(hidden_states.dtype)
         if hasattr(weights, 'grad') and weights.grad != None:
             torch.addmm(
                     weights.grad,
