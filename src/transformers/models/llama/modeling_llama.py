@@ -172,33 +172,33 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
-            up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def sub_forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
 
+    def forward(self, x):
+
+        
+        bsz, q_len, _ = x.size()
+
+        chunk_size = 4096
+        x_list = list(x.split(chunk_size, dim=1))
+            
+        output_list = [None for _ in range(len(x_list))]
+
+        for i in range(len(x_list)):
+            output = self.sub_forward(x_list[i])
+            output_list[i] = output
+
+        down_proj = torch.cat(output_list, dim=1)
+        
+        return down_proj
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -986,6 +986,80 @@ class LlamaModel(LlamaPreTrainedModel):
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
 
         return causal_mask
+import torch.nn.functional as F
+
+class _cross_entropy(torch.autograd.Function):
+
+    @classmethod
+    def forward(cls, ctx, hidden_states, indices, weights):
+        logits = F.linear(hidden_states, weights).float()
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
+        loss_i = loss_fct(logits, indices)
+
+        ignore_index = -100
+        mask = indices != ignore_index
+        reverse_mask = indices == ignore_index
+        
+        batch_size = torch.sum(indices != ignore_index)
+
+        grad_input = F.softmax(logits, dim=-1)
+        grad_input[mask, indices[mask]] -= 1
+        # grad_input[mask] /= batch_size
+        grad_input[reverse_mask] = 0
+        grad_input = grad_input.to(torch.bfloat16)
+        if hasattr(weights, 'grad') and weights.grad != None:
+            torch.addmm(
+                    weights.grad,
+                    grad_input.T,
+                    hidden_states,
+                    out=weights.grad,
+                )
+        else:
+            weights.grad = grad_input.T @ hidden_states
+            
+        grad_input = grad_input @ weights
+
+        weights.grad_mul = False
+        
+        ctx.save_for_backward(grad_input, weights)
+        
+        return loss_i
+
+    @classmethod
+    def backward(cls, ctx, dneg_logprobs):
+        """We know d(-log(p[i])/dlogit[k] = -id_mat[i,k] + p[k]
+        so we initialize the gradient as neg_logprobs, so we can just exponentiate
+        to get p[k], which is most of what we need...  neg_logprobs will be
+        modified in place to become the gradient we want
+        """
+        # load saved tensors
+        grad_input, weights = ctx.saved_tensors
+        # dneg_logprobs = dneg_logprobs / weights.mul
+        if weights.grad_mul is False:
+            weights.grad *= dneg_logprobs
+            weights.grad_mul = True
+        grad_input *= dneg_logprobs
+        
+        return grad_input, None, None
+
+
+class FusedCrossEntropyLMhead(nn.Module):
+    def __init__(
+        self,
+        original_weight = None
+    ):
+        super().__init__()
+        if original_weight is None:
+            self.LM_head_weight = nn.Parameter(torch.empty(hidden_size, vocab_size))
+        else:
+            self.LM_head_weight = original_weight
+        self.cross_entropy = _cross_entropy.apply
+
+    def forward(self, hidden_states, labels):
+        ignore_index = -100
+        loss = self.cross_entropy(hidden_states, labels, self.LM_head_weight)
+        return loss
+
 
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
@@ -1017,6 +1091,45 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+
+    def narrow_processing(self, hidden_states, labels):
+
+        bsz, q_len, hidden_size = hidden_states.size()
+        tmp = q_len // self.pretraining_tp
+
+        if labels is None:
+            hidden_states = hidden_states[..., -1:, :]
+            logits = self.lm_head(hidden_states)
+            logits = logits.float()
+            return logits, None
+
+        hidden_states = hidden_states[..., :-1, :]
+
+        labels = labels[..., 1:].contiguous()
+        labels = labels.to(hidden_states.device)
+
+        Fused = FusedCrossEntropyLMhead(self.lm_head.weight)
+        
+        loss = None
+        for i in range(self.pretraining_tp):
+
+
+            shift_hidden_states = hidden_states[..., i * tmp : (i+1)*tmp, :].contiguous()
+            shift_hidden_states = shift_hidden_states.view(-1, hidden_size)
+            shift_labels = labels[..., i * tmp : (i+1)*tmp ].contiguous()
+            shift_labels = shift_labels.view(-1)
+
+            loss_i = Fused(shift_hidden_states, shift_labels)
+
+            if not torch.isnan(loss_i):
+                if loss is None:
+                    loss = loss_i
+                else:
+                    loss = loss + loss_i
+            # print(i, loss_i, loss)
+
+        loss = loss / torch.sum(torch.ne(labels, -100))
+        return None, loss
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1079,27 +1192,32 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             cache_position=cache_position,
         )
 
-        hidden_states = outputs[0]
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        self.minis = 32
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+        hidden_states = outputs[0]
+
+        logits, loss = self.narrow_processing(hidden_states, labels)
+                
+        # if self.config.pretraining_tp > 1:
+        #     lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+        #     logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+        #     logits = torch.cat(logits, dim=-1)
+        # else:
+        #     logits = self.lm_head(hidden_states)
+        # logits = logits.float()
+
+        # loss = None
+        # if labels is not None:
+        #     # Shift so that tokens < n predict n
+        #     shift_logits = logits[..., :-1, :].contiguous()
+        #     shift_labels = labels[..., 1:].contiguous()
+        #     # Flatten the tokens
+        #     loss_fct = CrossEntropyLoss()
+        #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        #     shift_labels = shift_labels.view(-1)
+        #     # Enable model parallelism
+        #     shift_labels = shift_labels.to(shift_logits.device)
+        #     loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
